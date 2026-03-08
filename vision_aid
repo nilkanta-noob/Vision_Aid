@@ -1,0 +1,598 @@
+// keyBoardWarriors ( nil , joy ,snigdha , avi)
+#include <Wire.h>
+#include <math.h>
+#include "Adafruit_VL53L0X.h"
+#include "Adafruit_VL53L1X.h"
+#include <MPU6050_tockn.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// I2C pins 
+#define SDA_PIN 21 // yellow 
+#define SCL_PIN 22  // red 
+
+//  XSHUT pins 
+#define XSHUT_LEFT   25
+#define XSHUT_FRONT  26
+#define XSHUT_RIGHT  27
+#define XSHUT_DOWN   14
+
+
+//  New I2C addresses
+#define ADDR_LEFT   0x30
+#define ADDR_FRONT  0x31
+#define ADDR_RIGHT  0x32
+
+
+
+// left right vibrator auti 
+
+int leftmotor=13;
+int rightmotor=12;
+
+#define PWM_FREQ     5000
+#define PWM_RES      8
+#define CH_LEFT      0
+#define CH_RIGHT     1
+
+
+// Create 3 sensor objects
+Adafruit_VL53L0X leftSensor;
+Adafruit_VL53L0X frontSensor;
+Adafruit_VL53L0X rightSensor;
+Adafruit_VL53L1X downSensor = Adafruit_VL53L1X();
+MPU6050 mpu(Wire);
+
+// oled screen 
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+
+
+// haptic vibraation priority
+enum SystemState{
+  STATE_CLEAR,
+  STATE_SIDE,
+  STATE_FRONT,
+  STATE_DROP
+};
+SystemState currentState;
+
+
+// thresholds for states 
+int side_threshold=110;
+int front_threshold= 200; // max 
+int down_threshold = 150;// to be later 
+double previous_down=0;
+double filtered_down=0;
+bool   dropDetected=false;
+bool   raiseDetected=false;
+// depth
+double Height_global=0;
+bool calibrated = false;
+double calibrationSum = 0;
+int calibrationCount = 0;
+
+const int CALIBRATION_LOOPS = 100;
+const int ELEVATION_THRESHOLD = 15;
+
+
+
+// front pulse timing 
+bool pulseState=false;
+const int pulseInterval=250; // 250 ms of pulse 
+unsigned long lastPulse = 0; // unsigned means non negetive value for millis()
+
+// mpu 
+double pitch = 0;
+double roll  = 0;
+double dt = 0;   // 10ms loop
+unsigned long lastMPUTime = 0;
+
+
+
+void setup() {  
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  Serial.println("MPU6050 Test Starting...");
+
+  mpu.begin();
+  mpu.calcGyroOffsets(true);  
+  // initialize pitch and roll from accelerometer
+mpu.update();
+mpu.update();
+mpu.update();
+lastMPUTime=millis();
+
+lastMPUTime = millis();
+
+  Serial.println("MPU6050 Ready");
+  
+  
+  // oled display 
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+  Serial.println("OLED not found");
+  while(true);
+}
+
+display.clearDisplay();
+display.setTextSize(1);
+display.setTextColor(SSD1306_WHITE);
+display.display();
+
+  
+
+
+  delay(200);
+
+  // Start I2C
+
+
+  // Set XSHUT pins as output
+  pinMode(XSHUT_LEFT, OUTPUT);
+  pinMode(XSHUT_FRONT, OUTPUT);
+  pinMode(XSHUT_RIGHT, OUTPUT);
+  pinMode(XSHUT_DOWN, OUTPUT);
+
+  // Turn ALL sensors OFF
+  digitalWrite(XSHUT_LEFT, LOW);
+  digitalWrite(XSHUT_FRONT, LOW);
+  digitalWrite(XSHUT_RIGHT, LOW);
+  digitalWrite(XSHUT_DOWN, LOW);
+  delay(50);
+
+  // left
+  digitalWrite(XSHUT_LEFT, HIGH);     // turn ON
+  delay(50);
+  leftSensor.begin(0x29, &Wire);      // default address
+  leftSensor.setAddress(ADDR_LEFT);   // change address
+
+  // front
+  digitalWrite(XSHUT_FRONT, HIGH);
+  delay(50);
+  frontSensor.begin(0x29, &Wire);
+  frontSensor.setAddress(ADDR_FRONT);
+
+  // RIGHT 
+  digitalWrite(XSHUT_RIGHT, HIGH);
+  delay(50);
+  rightSensor.begin(0x29, &Wire);
+  rightSensor.setAddress(ADDR_RIGHT);
+
+  // down
+  digitalWrite(XSHUT_DOWN, HIGH);
+  delay(50);
+  downSensor.begin(0x29, &Wire);
+ 
+  //downSensor.setDistanceMode(VL53L1X_LONG); not for this lib 
+  
+
+  downSensor.startRanging();
+
+
+  Serial.println("4 sensors Ready");
+  
+
+  // PWM Setup
+ ledcAttach(leftmotor,PWM_FREQ,PWM_RES);
+ ledcAttach(rightmotor,PWM_FREQ,PWM_RES);
+ ledcWrite(leftmotor, 0);
+ ledcWrite(rightmotor, 0);
+}
+
+
+
+void oledPrint(double left, double front, double right,double height,double Height_global,double pitch,double roll ,SystemState state)
+{
+  display.clearDisplay();
+  display.setCursor(0,0);
+
+  display.print("L:");
+  display.print(left);
+  display.print(" F:");
+  display.println(front);
+
+  display.print("R:");
+  display.print(right);
+  display.print(" H:");
+  display.println(height);
+
+  display.print("H_G:");
+  display.println(Height_global);
+
+  display.print("P:");
+  display.print(pitch);
+  display.print(" R:");
+  display.println(roll);
+
+  display.print("S:");
+
+  switch(state){
+    case STATE_CLEAR: display.print("CLEAR"); break;
+    case STATE_SIDE:  display.print("SIDE"); break;
+    case STATE_FRONT: display.print("FRONT"); break;
+    case STATE_DROP:  display.print("DROP"); break;
+  }
+
+  display.display();
+}
+
+
+
+     void printDistances(double left, double front, double right,double height,double Height_global,double pitch,double roll ,SystemState state) {
+
+  Serial.print("L: ");
+  if (left <= 0 || left > 120) Serial.print("OUT");
+  else {
+    Serial.print(left);
+    Serial.print("cm");
+  }
+
+  Serial.print("    |    F: ");
+  if (front <= 0 || front > 120) Serial.print("OUT");
+  else {
+    Serial.print(front);
+    Serial.print("cm");
+  }
+
+  Serial.print("    |    R: ");
+  if (right <= 0 || right > 120) Serial.print("OUT");
+  else {
+    Serial.print(right);
+    Serial.print("cm");
+  }
+
+
+  Serial.print("    |    H: ");
+ 
+    Serial.print(height);
+    Serial.print("cm");
+
+  Serial.print("    |  h_g: ");
+ 
+    Serial.print(Height_global);
+    Serial.print("cm");  
+    
+  Serial.print("| pitch : ");
+ 
+    Serial.print(pitch);
+    Serial.print(" ");
+    
+  Serial.print(" roll  : ");
+ 
+    Serial.print(roll);
+    Serial.print(" ");
+  
+
+   // ---- State ----
+  Serial.print("  | STATE: ");
+
+  switch (state) {
+    case STATE_CLEAR:
+      Serial.print("CLEAR");
+      break;
+
+    case STATE_SIDE:
+      Serial.print("SIDE");
+      break;
+
+    case STATE_FRONT:
+      Serial.print("FRONT");
+      break;
+
+    case STATE_DROP:
+      Serial.print("DROP");
+      break;
+  }
+
+  Serial.println();
+}
+   
+
+   void calibrateHeight(double height)
+{
+  if(calibrated) return;
+
+  if(height<=0) return;
+
+  calibrationSum += height;
+  calibrationCount++;
+
+  if(calibrationCount >= CALIBRATION_LOOPS)
+  {
+    Height_global = calibrationSum / calibrationCount;
+    calibrated = true;
+
+    Serial.print("Ground Height Calibrated: ");
+    Serial.println(Height_global);
+  }
+}
+
+
+
+
+bool checkElevation(double height)
+{
+  if(!calibrated) return false;
+
+  double delta = Height_global - height;
+
+  if(delta > ELEVATION_THRESHOLD)
+  {
+    return true;
+  }
+
+  return false;
+}
+
+
+
+
+     void loop() {
+ 
+ 
+  // angles calculating 
+  double angles[2];
+  angle(angles);
+
+  pitch = angles[0];
+  roll= angles[1];
+ // ----- 
+
+
+  VL53L0X_RangingMeasurementData_t measure;
+ ;
+
+  // LEFT
+  leftSensor.rangingTest(&measure, false);
+
+  double left= measure.RangeMilliMeter/10.0;
+  
+  // FRONT
+  frontSensor.rangingTest(&measure, false);
+
+  double front= measure.RangeMilliMeter/10.0;
+
+  // RIGHT
+  rightSensor.rangingTest(&measure, false);
+ double right = measure.RangeMilliMeter / 10.0;
+
+
+
+
+
+ // down 
+   double down = -1;
+   double delta=0;
+  
+   if(downSensor.dataReady()) {
+  down = downSensor.distance() / 10.0;
+  downSensor.clearInterrupt();
+
+   }
+
+
+
+ double height = -1;
+
+if(down > 0)
+{
+  height = down * cos(pitch * PI / 180.0);
+}
+
+calibrateHeight(height);
+
+bool dropActive_elevation = checkElevation(height);
+//bool dropActive_depth= checkDepth(height)
+
+
+
+
+
+  
+
+
+   
+
+    // finding what's acive 
+
+  bool leftActive=(left > 0 && left < side_threshold);
+    bool rightActive=(right > 0 && right < side_threshold);
+     bool frontActive=(front > 0 && front < front_threshold);
+       bool dropActive =dropActive_elevation;  
+   
+      
+        // defining the current states 
+
+           if (frontActive) {
+                currentState=STATE_FRONT;
+            }
+           else if(dropActive){ // 1 feature left to add 
+              currentState=STATE_DROP;
+            }
+         
+            else if(leftActive||rightActive){
+                currentState=STATE_SIDE;
+            }
+            else {
+              currentState=STATE_CLEAR;
+            }
+
+              // printing sensor values and states  
+               printDistances(left, front, right,height,Height_global,pitch,roll,currentState);
+                 oledPrint( left,  front, right,  height,Height_global,  pitch,  roll,  currentState);
+ 
+       // now lets do the haptics from the aforementioned states found 
+
+          switch (currentState) {
+              
+             
+
+              case STATE_FRONT:
+                    patternFront(front);
+                    break;
+
+               case STATE_DROP:
+                    patternRaise();
+                   break;      
+
+               case STATE_SIDE:
+                   patternSide(leftActive,rightActive,left,right);
+                   break;      
+               case STATE_CLEAR:
+                   noPattern();
+                   break;
+               default :
+                    noPattern();
+
+
+          }
+
+
+
+
+
+  delay(30);
+}
+void angle(double result[2]) {
+
+  mpu.update();
+  
+
+  unsigned long now = millis();
+  dt = (now - lastMPUTime) * 0.001;   // convert ms → seconds
+  lastMPUTime = now;
+
+  float ax = mpu.getAccX();
+  float ay = mpu.getAccY();
+  float az = mpu.getAccZ();
+
+  float gx = mpu.getGyroX();
+  float gy = mpu.getGyroY();
+
+  // Accelerometer angles
+  float accRoll  = atan2(ay, az) * 180.0 / PI;
+  float accPitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+
+  // Gyro integration
+  roll  += gx * dt;
+  pitch += gy * dt;
+
+  const float alpha = 0.97;
+
+  // Complementary filter
+  roll  = alpha * roll  + (1 - alpha) * accRoll;
+  pitch = alpha * pitch + (1 - alpha) * accPitch;
+
+  result[0] = pitch;
+  result[1] = roll;
+}
+
+    void noPattern(){
+      ledcWrite(leftmotor, 0);
+      ledcWrite(rightmotor, 0);
+    }
+     
+    void patternSide(bool leftActive, bool rightActive, double  left , double right){
+            
+             if(leftActive){// left is active 
+                    
+                    int pwm = map((int)left,0,side_threshold,255,100);
+                    ledcWrite(leftmotor, pwm);
+                   
+             }
+             else {
+                     ledcWrite(leftmotor, 0);
+             }
+    
+             
+             
+             if(rightActive){// left is active 
+                    
+                    int pwm = map((int)right,0,side_threshold,255,100);
+                    ledcWrite(rightmotor, pwm);
+                   
+             }
+             else {
+                     ledcWrite(rightmotor, 0);
+             }
+
+           
+    } 
+
+    void patternFront(double front){
+     
+        int strength=map((int)front,0,front_threshold,255,100);
+  
+        // has enough time passed since last pulse  .... just toggle on and off 
+        if(millis()-lastPulse>pulseInterval){
+          lastPulse=millis();
+          pulseState=!pulseState;
+        }
+
+        if(pulseState){
+          ledcWrite(leftmotor, strength);
+          ledcWrite(rightmotor, strength);
+        }
+         else{
+           noPattern();
+    }
+    }
+
+void patternDrop()
+{
+  static unsigned long last = 0;
+  static int step = 0;
+
+  if(millis() - last > 120)
+  {
+    last = millis();
+    step++;
+
+    if(step > 4) step = 0;
+  }
+
+  int intensity;
+
+  switch(step)
+  {
+    case 0: intensity = 255; break;  // very strong
+    case 1: intensity = 180; break;  // medium
+    case 2: intensity = 100; break;  // weak
+    case 3: intensity = 180; break;  // medium
+    case 4: intensity = 255; break;  // strong again
+  }
+
+  ledcWrite(leftmotor, intensity);
+  ledcWrite(rightmotor, intensity);
+}
+
+     void patternRaise() // bb ... bb .... bb ....bb  
+    {  
+       
+  static unsigned long last = 0;
+  static int step = 0;
+
+  if(millis() - last > 120)
+  {
+    last = millis();
+    step++;
+
+    if(step > 5) step = 0;
+  }
+
+  if(step == 0 || step == 2)
+  {
+    ledcWrite(leftmotor, 240);
+    ledcWrite(rightmotor, 240);
+  }
+  else
+  {
+    noPattern();
+  }
+}
+
+
+
